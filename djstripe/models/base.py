@@ -601,6 +601,9 @@ class StripeModel(models.Model):
                         # but still present during sync. For example, if a refund is
                         # issued on a charge whose payment method has been deleted.
                         return None, False
+                    elif "A source must be attached to a customer to be used as a `payment_method`" in str(e):
+                        # fix for single-use sources (apple pay, google pay)
+                        return None, False
                     else:
                         raise
                 should_expand = False
