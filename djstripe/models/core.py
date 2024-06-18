@@ -888,7 +888,7 @@ class Customer(StripeModel):
             items=_items, customer=self.id, **kwargs
         )
 
-        Subscription.sync_from_stripe_data(stripe_subscription)
+        return Subscription.sync_from_stripe_data(stripe_subscription)
 
     def charge(
         self,
