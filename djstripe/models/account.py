@@ -22,8 +22,12 @@ class Account(StripeModel):
     business_profile = JSONField(
         null=True, blank=True, help_text="Optional information related to the business."
     )
-    business_type = StripeEnumField(
-        enum=enums.BusinessType, default="", blank=True, help_text="The business type."
+    business_type = models.CharField(
+        max_length=255,
+        default="",
+        blank=True,
+        null=True,
+        help_text="The business type.",
     )
     charges_enabled = models.BooleanField(
         help_text="Whether the account can create live charges"
