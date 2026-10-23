@@ -205,7 +205,7 @@ class TestChargeRefundEvents(EventTestCase):
         user = get_user_model().objects.create_user(
             username="pydanny", email="pydanny@gmail.com"
         )
-        self.customer = FAKE_CUSTOMER.create_for_user(user)
+        FAKE_CUSTOMER.create_for_user(user)
 
         self._start_patch(
             "djstripe.models.Account.get_default_account",
@@ -596,7 +596,9 @@ class TestCustomerTaxIdEvents(EventTestCase):
     @patch("djstripe.models.TaxId.api_retrieve", autospec=True)
     def test_tax_id_updated_after_delete_on_stripe(self, tax_id_retrieve_mock):
         tax_id_retrieve_mock.side_effect = InvalidRequestError(
-            "Customer does not have a TaxID object", "id", http_status=404
+            "Customer cus_x does not have a TaxID object with ID txi_x",
+            "id",
+            http_status=404,
         )
 
         self._create_event(self.event_data).invoke_webhook_handlers()
@@ -604,15 +606,18 @@ class TestCustomerTaxIdEvents(EventTestCase):
         self.assertFalse(TaxId.objects.filter(id=self.tax_id.id).exists())
 
     @patch("djstripe.models.TaxId.api_retrieve", autospec=True)
-    def test_tax_id_updated_other_error_raises(self, tax_id_retrieve_mock):
-        tax_id_retrieve_mock.side_effect = InvalidRequestError(
-            "Invalid request", "id", http_status=400
-        )
+    def test_tax_id_updated_other_errors_raise(self, tax_id_retrieve_mock):
+        for error in (
+            InvalidRequestError("Invalid request", "id", http_status=400),
+            InvalidRequestError("No such customer: 'cus_x'", "id", http_status=404),
+        ):
+            with self.subTest(error=str(error)):
+                tax_id_retrieve_mock.side_effect = error
 
-        with self.assertRaises(InvalidRequestError):
-            self._create_event(self.event_data).invoke_webhook_handlers()
+                with self.assertRaises(InvalidRequestError):
+                    self._create_event(self.event_data).invoke_webhook_handlers()
 
-        self.assertTrue(TaxId.objects.filter(id=self.tax_id.id).exists())
+                self.assertTrue(TaxId.objects.filter(id=self.tax_id.id).exists())
 
 
 class TestDisputeEvents(EventTestCase):
