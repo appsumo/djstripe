@@ -15,6 +15,8 @@ NOTE:
 """
 import logging
 
+from stripe.error import InvalidRequestError
+
 from . import models, webhooks
 from .enums import SourceType
 from .utils import convert_tstamp
@@ -128,9 +130,21 @@ def customer_tax_id_webhook_handler(event):
     """
     Handle updates to customer tax ID objects.
     """
-    _handle_crud_like_event(
-        target_cls=models.TaxId, event=event, crud_type=CrudType.determine(event=event)
-    )
+    try:
+        _handle_crud_like_event(
+            target_cls=models.TaxId,
+            event=event,
+            crud_type=CrudType.determine(event=event),
+        )
+    except InvalidRequestError as e:
+        # The tax ID can be deleted on Stripe before this event is processed,
+        # so retrieving it 404s ("does not have a TaxID object"). Treat it as
+        # a delete rather than failing the webhook on every retry.
+        if e.http_status != 404:
+            raise
+        tax_id = event.data.get("object", {}).get("id", "")
+        logger.info("Tax ID %s no longer exists on Stripe, deleting it", tax_id)
+        models.TaxId.objects.filter(id=tax_id).delete()
 
 
 @webhooks.handler("payment_method")
@@ -203,6 +217,10 @@ def other_object_webhook_handler(event):
         # Do not attempt to handle charge.dispute.* events.
         # We do not have a Dispute model yet.
         target_cls = models.Dispute
+    elif event.parts[:2] == ["charge", "refund"]:
+        # charge.refund.* events carry a Refund (re_/pyr_ id), not a Charge.
+        _handle_charge_refund_event(event)
+        return
     else:
         target_cls = {
             "charge": models.Charge,
@@ -226,6 +244,25 @@ def other_object_webhook_handler(event):
 #
 # Helpers
 #
+
+
+def _handle_charge_refund_event(event):
+    """
+    Sync the Refund in a charge.refund.* event and its parent Charge.
+
+    The Charge goes first. Its amount_refunded and refunded change when a refund
+    fails, and its sync creates the Refund if it is not local yet. Syncing a new
+    Refund before its Charge fails, as the Charge sync creates the same Refund.
+    """
+    charge_id = event.data.get("object", {}).get("charge")
+    if charge_id:
+        _handle_crud_like_event(
+            target_cls=models.Charge,
+            event=event,
+            id=charge_id,
+            crud_type=CrudType(updated=True),
+        )
+    _handle_crud_like_event(target_cls=models.Refund, event=event)
 
 
 class CrudType(object):

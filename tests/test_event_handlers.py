@@ -23,18 +23,22 @@ from djstripe.models import (
     PaymentMethod,
     Plan,
     Price,
+    Refund,
     Subscription,
     SubscriptionSchedule,
+    TaxId,
     Transfer,
 )
 
 from . import (
     FAKE_ACCOUNT,
     FAKE_BALANCE_TRANSACTION,
+    FAKE_BALANCE_TRANSACTION_REFUND,
     FAKE_CARD,
     FAKE_CARD_AS_PAYMENT_METHOD,
     FAKE_CHARGE,
     FAKE_CHARGE_II,
+    FAKE_CHARGE_REFUNDED,
     FAKE_COUPON,
     FAKE_CUSTOMER,
     FAKE_CUSTOMER_II,
@@ -42,6 +46,7 @@ from . import (
     FAKE_EVENT_ACCOUNT_APPLICATION_DEAUTHORIZED,
     FAKE_EVENT_CARD_PAYMENT_METHOD_ATTACHED,
     FAKE_EVENT_CARD_PAYMENT_METHOD_DETACHED,
+    FAKE_EVENT_CHARGE_REFUND_UPDATED,
     FAKE_EVENT_CHARGE_SUCCEEDED,
     FAKE_EVENT_CUSTOMER_CREATED,
     FAKE_EVENT_CUSTOMER_DELETED,
@@ -86,6 +91,7 @@ from . import (
     FAKE_PLAN,
     FAKE_PRICE,
     FAKE_PRODUCT,
+    FAKE_REFUND,
     FAKE_SUBSCRIPTION,
     FAKE_SUBSCRIPTION_CANCELED,
     FAKE_SUBSCRIPTION_III,
@@ -188,6 +194,161 @@ class TestChargeEvents(EventTestCase):
             fake_stripe_event["data"]["object"]["amount"] / Decimal("100"),
         )
         self.assertEqual(charge.status, fake_stripe_event["data"]["object"]["status"])
+
+
+class TestChargeRefundEvents(EventTestCase):
+    """
+    charge.refund.* events carry a Refund object (re_ or pyr_ id), not a Charge.
+    """
+
+    def setUp(self):
+        user = get_user_model().objects.create_user(
+            username="pydanny", email="pydanny@gmail.com"
+        )
+        self.customer = FAKE_CUSTOMER.create_for_user(user)
+
+        self._start_patch(
+            "djstripe.models.Account.get_default_account",
+            autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+            return_value=default_account(),
+        )
+        balance_transactions = {
+            txn["id"]: txn
+            for txn in (FAKE_BALANCE_TRANSACTION, FAKE_BALANCE_TRANSACTION_REFUND)
+        }
+        self._start_patch(
+            "stripe.BalanceTransaction.retrieve",
+            side_effect=lambda id, **kwargs: deepcopy(balance_transactions[id]),
+        )
+        for target, fake in (
+            ("stripe.Invoice.retrieve", FAKE_INVOICE),
+            ("stripe.PaymentIntent.retrieve", FAKE_PAYMENT_INTENT_I),
+            ("stripe.PaymentMethod.retrieve", FAKE_CARD_AS_PAYMENT_METHOD),
+            ("stripe.Product.retrieve", FAKE_PRODUCT),
+            ("stripe.Subscription.retrieve", FAKE_SUBSCRIPTION),
+        ):
+            self._start_patch(target, return_value=deepcopy(fake))
+        # Stripe charges by id. Tests overwrite entries to change what Stripe
+        # returns. Retrieving an unknown id (like a refund id) raises KeyError.
+        self.stripe_charges = {FAKE_CHARGE["id"]: deepcopy(FAKE_CHARGE)}
+        self.charge_retrieve_mock = self._start_patch(
+            "stripe.Charge.retrieve",
+            side_effect=lambda id, **kwargs: deepcopy(self.stripe_charges[id]),
+        )
+        self.refund_retrieve_mock = self._start_patch("stripe.Refund.retrieve")
+
+    def _start_patch(self, target, **kwargs):
+        patcher = patch(target, **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def _stripe_data(self, refund_id, charge_id, refund_status):
+        """Return (refund, charge, event) Stripe payloads for the given ids."""
+        stripe_charge = deepcopy(FAKE_CHARGE_REFUNDED)
+        stripe_charge["id"] = charge_id
+        stripe_refund = deepcopy(FAKE_REFUND)
+        stripe_refund.update(
+            {"id": refund_id, "charge": charge_id, "status": refund_status}
+        )
+        stripe_charge["refunds"]["data"] = [deepcopy(stripe_refund)]
+        event = deepcopy(FAKE_EVENT_CHARGE_REFUND_UPDATED)
+        event["data"]["object"] = deepcopy(stripe_refund)
+        return stripe_refund, stripe_charge, event
+
+    def _process(self, event_data):
+        event = self._create_event(event_data)
+        event.invoke_webhook_handlers()
+
+    def _assert_charge_retrieve_ids(self, charge_id):
+        retrieved_ids = [c.kwargs["id"] for c in self.charge_retrieve_mock.mock_calls]
+        self.assertTrue(retrieved_ids)
+        self.assertEqual(set(retrieved_ids), {charge_id})
+
+    def test_charge_refund_updated_syncs_refund_and_parent_charge(self):
+        # The charge is in the DB from before the refund, so it is stale.
+        Charge.sync_from_stripe_data(deepcopy(FAKE_CHARGE))
+        self.assertFalse(Charge.objects.get(id=FAKE_CHARGE["id"]).refunded)
+
+        stripe_refund, stripe_charge, event = self._stripe_data(
+            FAKE_REFUND["id"], FAKE_CHARGE["id"], "succeeded"
+        )
+        self.refund_retrieve_mock.return_value = stripe_refund
+        self.stripe_charges[stripe_charge["id"]] = stripe_charge
+        self.charge_retrieve_mock.reset_mock()
+
+        self._process(event)
+
+        self.refund_retrieve_mock.assert_called_once_with(
+            id=stripe_refund["id"], api_key=ANY, expand=ANY, stripe_account=ANY
+        )
+        # Charge.retrieve is only ever called with the charge id, never the
+        # refund id. That was the "No such charge: 're_...'" bug.
+        self._assert_charge_retrieve_ids(FAKE_CHARGE["id"])
+
+        refund = Refund.objects.get(id=stripe_refund["id"])
+        self.assertEqual(refund.status, "succeeded")
+        self.assertEqual(refund.charge.id, FAKE_CHARGE["id"])
+
+        charge = Charge.objects.get(id=FAKE_CHARGE["id"])
+        self.assertTrue(charge.refunded)
+        self.assertEqual(
+            charge.amount_refunded,
+            stripe_charge["amount_refunded"] / Decimal("100"),
+        )
+
+    def test_charge_refund_updated_pyr_refund_updates_stale_status(self):
+        # pyr_ refunds belong to py_ payments and can start as pending. A
+        # pending local row whose refund later succeeded is what the bug left.
+        stripe_refund, stripe_charge, event = self._stripe_data(
+            "pyr_1E0he8KatMEEd8456454S01Vc", "py_1E0he8KatMEEd84561fBn6qT", "pending"
+        )
+        # FAKE_INVOICE points back at FAKE_CHARGE, not this py_ charge.
+        stripe_charge["invoice"] = None
+        Charge.sync_from_stripe_data(deepcopy(stripe_charge))
+        self.assertEqual(Refund.objects.get(id=stripe_refund["id"]).status, "pending")
+
+        stripe_refund["status"] = "succeeded"
+        stripe_charge["refunds"]["data"] = [deepcopy(stripe_refund)]
+        self.stripe_charges[stripe_charge["id"]] = stripe_charge
+        self.refund_retrieve_mock.return_value = stripe_refund
+        event["data"]["object"]["status"] = "succeeded"
+
+        self._process(event)
+
+        self.refund_retrieve_mock.assert_called_once_with(
+            id=stripe_refund["id"], api_key=ANY, expand=ANY, stripe_account=ANY
+        )
+        self._assert_charge_retrieve_ids(stripe_charge["id"])
+        self.assertEqual(Refund.objects.get(id=stripe_refund["id"]).status, "succeeded")
+
+    def test_charge_refund_updated_before_charge_is_local(self):
+        # Stripe does not order events, so this can arrive before the
+        # charge.refunded event that would create the Charge and Refund.
+        stripe_refund, stripe_charge, event = self._stripe_data(
+            FAKE_REFUND["id"], FAKE_CHARGE["id"], "succeeded"
+        )
+        self.refund_retrieve_mock.return_value = stripe_refund
+        self.stripe_charges[stripe_charge["id"]] = stripe_charge
+
+        self._process(event)
+
+        self._assert_charge_retrieve_ids(FAKE_CHARGE["id"])
+        self.assertTrue(Charge.objects.get(id=FAKE_CHARGE["id"]).refunded)
+        self.assertEqual(Refund.objects.get(id=stripe_refund["id"]).status, "succeeded")
+
+    def test_charge_refunded_still_syncs_charge(self):
+        # charge.refunded carries a Charge, so it keeps the Charge path.
+        stripe_charge = deepcopy(FAKE_CHARGE_REFUNDED)
+        self.stripe_charges[stripe_charge["id"]] = stripe_charge
+        event = deepcopy(FAKE_EVENT_CHARGE_SUCCEEDED)
+        event.update({"id": "evt_1E0hfaKatMEEd8456bRfNd3d", "type": "charge.refunded"})
+        event["data"]["object"] = deepcopy(stripe_charge)
+
+        self._process(event)
+
+        self.refund_retrieve_mock.assert_not_called()
+        self._assert_charge_retrieve_ids(stripe_charge["id"])
+        self.assertTrue(Charge.objects.get(id=stripe_charge["id"]).refunded)
 
 
 class TestCustomerEvents(EventTestCase):
@@ -397,6 +558,61 @@ class TestCustomerEvents(EventTestCase):
 
         event = Event.sync_from_stripe_data(fake_stripe_event)
         event.invoke_webhook_handlers()
+
+
+class TestCustomerTaxIdEvents(EventTestCase):
+    def setUp(self):
+        user = get_user_model().objects.create_user(
+            username="pydanny", email="pydanny@gmail.com"
+        )
+        self.customer = FAKE_CUSTOMER.create_for_user(user)
+        self.tax_id = TaxId.objects.create(
+            id="txi_1HbTfYKatMEEd8456sQ8Ruxz",
+            customer=self.customer,
+            country="US",
+            type="us_ein",
+            value="12-3456789",
+            verification={},
+            livemode=False,
+        )
+        self.event_data = {
+            "id": "evt_1HbTgZKatMEEd8456dTdIpEq",
+            "object": "event",
+            "api_version": "2020-08-27",
+            "created": 1602614392,
+            "data": {
+                "object": {
+                    "id": self.tax_id.id,
+                    "object": "tax_id",
+                    "customer": FAKE_CUSTOMER["id"],
+                }
+            },
+            "livemode": False,
+            "pending_webhooks": 0,
+            "request": "req_6lsB7hkicwhaDj",
+            "type": "customer.tax_id.updated",
+        }
+
+    @patch("djstripe.models.TaxId.api_retrieve", autospec=True)
+    def test_tax_id_updated_after_delete_on_stripe(self, tax_id_retrieve_mock):
+        tax_id_retrieve_mock.side_effect = InvalidRequestError(
+            "Customer does not have a TaxID object", "id", http_status=404
+        )
+
+        self._create_event(self.event_data).invoke_webhook_handlers()
+
+        self.assertFalse(TaxId.objects.filter(id=self.tax_id.id).exists())
+
+    @patch("djstripe.models.TaxId.api_retrieve", autospec=True)
+    def test_tax_id_updated_other_error_raises(self, tax_id_retrieve_mock):
+        tax_id_retrieve_mock.side_effect = InvalidRequestError(
+            "Invalid request", "id", http_status=400
+        )
+
+        with self.assertRaises(InvalidRequestError):
+            self._create_event(self.event_data).invoke_webhook_handlers()
+
+        self.assertTrue(TaxId.objects.filter(id=self.tax_id.id).exists())
 
 
 class TestDisputeEvents(EventTestCase):
