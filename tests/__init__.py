@@ -1828,6 +1828,18 @@ FAKE_EVENT_DISPUTE_CREATED = {
     "type": "charge.dispute.created",
 }
 
+FAKE_EVENT_CHARGE_REFUND_UPDATED = {
+    "id": "evt_1E0hfaKatMEEd8456aGqQ2Rb",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1549425864,
+    "data": {"object": deepcopy(FAKE_REFUND)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_6lsB7hkicwhaDj",
+    "type": "charge.refund.updated",
+}
+
 FAKE_EVENT_INVOICE_CREATED = {
     "id": "evt_187IHD2eZvKYlo2C6YKQi2eZ",
     "object": "event",

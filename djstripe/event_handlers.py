@@ -15,6 +15,8 @@ NOTE:
 """
 import logging
 
+from stripe.error import InvalidRequestError
+
 from . import models, webhooks
 from .enums import SourceType
 from .utils import convert_tstamp
@@ -128,9 +130,27 @@ def customer_tax_id_webhook_handler(event):
     """
     Handle updates to customer tax ID objects.
     """
-    _handle_crud_like_event(
-        target_cls=models.TaxId, event=event, crud_type=CrudType.determine(event=event)
-    )
+    try:
+        _handle_crud_like_event(
+            target_cls=models.TaxId,
+            event=event,
+            crud_type=CrudType.determine(event=event),
+        )
+    except InvalidRequestError as e:
+        # The tax ID can be deleted on Stripe before this event is processed,
+        # so retrieving it 404s ("does not have a TaxID object"). Treat it as
+        # a delete rather than failing the webhook on every retry. Any other
+        # error, including a missing customer, still raises.
+        if e.http_status != 404 or "TaxID" not in str(e):
+            raise
+        tax_id = event.data["object"]["id"]
+        deleted, _ = models.TaxId.objects.filter(id=tax_id).delete()
+        logger.warning(
+            "Event %s: tax ID %s no longer exists on Stripe, deleted %d local rows",
+            event.id,
+            tax_id,
+            deleted,
+        )
 
 
 @webhooks.handler("payment_method")
@@ -183,6 +203,8 @@ def other_object_webhook_handler(event):
     plan, product, setup_intent, subscription_schedule, source, tax_rate
     and transfer objects.
 
+    charge.refund.* events carry a Refund and go to _handle_charge_refund_event.
+
     Docs for:
     - charge: https://stripe.com/docs/api/charges
     - coupon: https://stripe.com/docs/api/coupons
@@ -198,6 +220,11 @@ def other_object_webhook_handler(event):
     - tax_rate: https://stripe.com/docs/api/tax_rates/
     - transfer: https://stripe.com/docs/api/transfers
     """
+
+    if event.parts[:2] == ["charge", "refund"]:
+        # charge.refund.* events carry a Refund (re_/pyr_ id), not a Charge.
+        _handle_charge_refund_event(event)
+        return
 
     if event.parts[:2] == ["charge", "dispute"]:
         # Do not attempt to handle charge.dispute.* events.
@@ -226,6 +253,26 @@ def other_object_webhook_handler(event):
 #
 # Helpers
 #
+
+
+def _handle_charge_refund_event(event):
+    """
+    Sync the parent Charge of a charge.refund.* event first, then the Refund.
+
+    The Charge's amount_refunded and refunded change with the refund (a failed
+    refund puts the amount back), and the Charge sync creates any Refund in
+    charge.refunds that is not local yet. Syncing a new Refund first fails:
+    creating it creates its Charge, whose sync inserts the same Refund, so the
+    outer insert rolls back and the fallback lookup raises Refund.DoesNotExist.
+    """
+    # Refund.charge is required, and webhook payloads never expand it.
+    _handle_crud_like_event(
+        target_cls=models.Charge,
+        event=event,
+        id=event.data["object"]["charge"],
+        crud_type=CrudType(updated=True),
+    )
+    _handle_crud_like_event(target_cls=models.Refund, event=event)
 
 
 class CrudType(object):
